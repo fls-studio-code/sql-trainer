@@ -296,6 +296,7 @@ function translate(sql) {
     p = p.replace(/\bISNULL\s*\(/gi, 'IFNULL(');
     p = p.replace(/\(\s*MAX\s*\)/gi, '');
     p = p.replace(/\b(?:NON)?CLUSTERED\b/gi, '');
+    p = p.replace(/\b(?:BIG|SMALL|TINY)?INT(?:EGER)?\s+(?:NOT\s+NULL\s+)?PRIMARY\s+KEY\s+IDENTITY\s*(?:\([^)]*\))?/gi, 'INTEGER PRIMARY KEY AUTOINCREMENT');
     p = p.replace(/\b(?:BIG|SMALL|TINY)?INT(?:EGER)?\s+IDENTITY\s*(?:\([^)]*\))?(\s+NOT\s+NULL)?(\s+PRIMARY\s+KEY)?/gi, 'INTEGER PRIMARY KEY AUTOINCREMENT');
     p = p.replace(/OFFSET\s+(\d+)\s+ROWS?\s+FETCH\s+(?:NEXT|FIRST)\s+(\d+)\s+ROWS?\s+ONLY/gi, 'LIMIT $2 OFFSET $1');
     return p;
@@ -320,9 +321,168 @@ function fmtErr(e) {
   if ((t = m.match(/UNIQUE constraint failed: ([^.]+)\./))) return `Msg 2627, Level 14, State 1\nViolation of PRIMARY KEY or UNIQUE constraint. Cannot insert duplicate key in object 'dbo.${t[1]}'.`;
   if (/FOREIGN KEY constraint failed/.test(m)) return `Msg 547, Level 16, State 0\nThe statement conflicted with the FOREIGN KEY constraint.`;
   if ((t = m.match(/table (\S+) has (\d+) columns but (\d+) values/))) return `Msg 213, Level 16, State 1\nColumn name or number of supplied values does not match table definition.`;
+  if ((t = m.match(/(\d+) values for (\d+) columns/))) {
+    return +t[1] > +t[2]
+      ? `Msg 110, Level 15, State 1\nThere are fewer columns in the INSERT statement than values specified in the VALUES clause. The number of values in the VALUES clause must match the number of columns specified in the INSERT statement.`
+      : `Msg 109, Level 15, State 1\nThere are more columns in the INSERT statement than values specified in the VALUES clause. The number of values in the VALUES clause must match the number of columns specified in the INSERT statement.`;
+  }
   if ((t = m.match(/near "([^"]*)": syntax error/))) return `Msg 102, Level 15, State 1\nIncorrect syntax near '${t[1]}'.`;
   if (/incomplete input/.test(m)) return `Msg 102, Level 15, State 1\nIncorrect syntax: the statement is incomplete.`;
   return `Msg 50000, Level 16, State 1\n${m}`;
+}
+
+/* ===================== проверка T-SQL-синтаксиса ===================== */
+/*VALIDATE-START*/
+const ALLOWED_FIRST = ['SELECT', 'WITH', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'DROP', 'ALTER', 'USE', 'TRUNCATE', 'PRINT', 'SET', 'EXEC', 'EXECUTE', 'DECLARE'];
+const NOT_SUPPORTED = ['IF', 'WHILE', 'MERGE', 'GRANT', 'REVOKE', 'DENY', 'BACKUP', 'RESTORE', 'RETURN', 'GOTO', 'BEGIN', 'COMMIT', 'ROLLBACK', 'SAVE', 'OPEN', 'FETCH', 'CLOSE', 'DEALLOCATE', 'CHECKPOINT', 'DBCC', 'KILL', 'WAITFOR', 'RAISERROR', 'THROW'];
+const T_LEN = ['char', 'varchar', 'nchar', 'nvarchar', 'binary', 'varbinary'];
+const T_NUM = ['decimal', 'numeric', 'dec'];
+const T_ARG1 = ['float', 'time', 'datetime2', 'datetimeoffset'];
+const T_NOARG = ['int', 'integer', 'bigint', 'smallint', 'tinyint', 'bit', 'date', 'datetime', 'smalldatetime', 'money', 'smallmoney', 'real', 'text', 'ntext', 'image', 'uniqueidentifier', 'xml', 'timestamp', 'rowversion', 'sql_variant'];
+const T_KNOWN = [].concat(T_LEN, T_NUM, T_ARG1, T_NOARG);
+
+function maskStrings(s) { return s.replace(/'(?:[^']|'')*'/g, x => "'" + ' '.repeat(x.length - 2) + "'"); }
+
+function splitTop(str) {
+  const out = []; let cur = '', q = false, d = 0;
+  for (const c of str) {
+    if (c === "'") { q = !q; cur += c; continue; }
+    if (!q) {
+      if (c === '(') d++;
+      else if (c === ')') d--;
+      else if (c === ',' && d === 0) { out.push(cur); cur = ''; continue; }
+    }
+    cur += c;
+  }
+  if (cur.trim() || out.length) out.push(cur);
+  return out;
+}
+
+const stripId = x => x.trim().replace(/^[\["]|[\]"]$/g, '');
+
+function validateCreateTable(body) {
+  const defs = splitTop(body);
+  if (!defs.length) throw TErr(102, "Incorrect syntax near ')'.");
+  let n = 0;
+  for (let i = 0; i < defs.length; i++) {
+    const def = defs[i].trim();
+    const last = i === defs.length - 1;
+    const near = last ? ')' : ',';
+    if (!def) throw TErr(102, `Incorrect syntax near '${near}'.`);
+    if (/^(CONSTRAINT|PRIMARY|FOREIGN|UNIQUE|CHECK)\b/i.test(def)) continue;
+    n++;
+    const mm = def.match(/^(\[[^\]]+\]|"[^"]*"|\w+)\s*([\s\S]*)$/);
+    if (!mm) throw TErr(102, `Incorrect syntax near '${def[0]}'.`);
+    const name = stripId(mm[1]), rest = mm[2].trim();
+    if (!rest) throw TErr(102, `Incorrect syntax near '${near}'.`);
+    if (/^AS\b/i.test(rest)) continue;
+    const tm = rest.match(/^(\w+)\s*(?:\(([^)]*)\))?/);
+    if (!tm) throw TErr(102, `Incorrect syntax near '${rest[0]}'.`);
+    const type = tm[1].toLowerCase();
+    const args = tm[2] !== undefined ? tm[2].split(',').map(x => x.trim()) : null;
+    if (!T_KNOWN.includes(type)) throw TErr(2715, `Column, parameter, or variable #${n}: Cannot find data type ${tm[1]}.`);
+    if (!args) continue;
+    if (T_NOARG.includes(type)) throw TErr(2716, `Column, parameter, or variable #${n}: Cannot specify a column width on data type ${type}.`);
+    if (T_LEN.includes(type)) {
+      if (args.length > 1) throw TErr(102, "Incorrect syntax near ','.");
+      if (!/^max$/i.test(args[0])) {
+        if (!/^\d+$/.test(args[0])) throw TErr(102, `Incorrect syntax near '${args[0] || ')'}'.`);
+        const lim = /^n/.test(type) ? 4000 : 8000, v = +args[0];
+        if (v > lim) throw TErr(131, `The size (${v}) given to the column '${name}' exceeds the maximum allowed for any data type (${lim}).`);
+      }
+    } else if (T_NUM.includes(type)) {
+      if (args.length > 2) throw TErr(102, "Incorrect syntax near ','.");
+    } else if (T_ARG1.includes(type) && args.length > 1) {
+      throw TErr(102, "Incorrect syntax near ','.");
+    }
+  }
+}
+
+function validateTsql(s, ctx) {
+  const m = maskStrings(s);
+  let t;
+  const fw = (m.match(/^\s*(\w+)/) || ['', ''])[1].toUpperCase();
+  const fullFirst = (s.match(/^\s*(\S+)/) || ['', ''])[1];
+  if (NOT_SUPPORTED.includes(fw)) throw TErr(40000, `${fw} is not supported in this trainer.`);
+  if (!ALLOWED_FIRST.includes(fw)) throw TErr(102, `Incorrect syntax near '${fullFirst}'.`);
+
+  if ((t = m.match(/\b(LIMIT|AUTO_?INCREMENT|ILIKE|UNSIGNED)\b/i))) throw TErr(102, `Incorrect syntax near '${t[1]}'.`);
+  if (/\|\|/.test(m)) throw TErr(102, "Incorrect syntax near '|'.");
+  if ((t = m.match(/\b(LENGTH|IFNULL|SUBSTR|INSTR|RANDOM|NOW|CURDATE|CURTIME|STRFTIME|GROUP_CONCAT|TYPEOF)\s*\(/i))) {
+    throw TErr(195, `'${t[1].toUpperCase()}' is not a recognized built-in function name.`);
+  }
+
+  if (/^(SELECT|WITH|INSERT|UPDATE|DELETE)$/.test(fw)) {
+    const re = /"([^"]*)"/g; let q;
+    while ((q = re.exec(m))) {
+      if (/\bAS\s*$/i.test(m.slice(0, q.index))) continue;
+      if (ctx.hasTable(q[1]) || ctx.hasColumn(q[1])) continue;
+      throw TErr(207, `Invalid column name '${q[1]}'.`);
+    }
+  }
+
+  if (fw === 'CREATE') {
+    if (/^\s*CREATE\s+(TEMP|TEMPORARY|VIRTUAL)\b/i.test(m)) throw TErr(102, `Incorrect syntax near '${(s.match(/^\s*CREATE\s+(\w+)/i) || ['', ''])[1]}'.`);
+    if (/^\s*CREATE\s+(TABLE|DATABASE|VIEW|INDEX)\s+IF\b/i.test(m)) throw TErr(156, "Incorrect syntax near the keyword 'IF'.");
+    if (/^\s*CREATE\s+TABLE\s+\S+\s+AS\b/i.test(m)) throw TErr(156, "Incorrect syntax near the keyword 'AS'.");
+    const cm = m.match(/^\s*CREATE\s+TABLE\s+[^(]+\(([\s\S]*)\)\s*$/i);
+    if (cm) validateCreateTable(cm[1]);
+  }
+
+  if (fw === 'INSERT') {
+    const im = m.match(/^\s*INSERT\s+(?:INTO\s+)?(?:\[?dbo\]?\s*\.\s*)?[\["]?(\w+)[\]"]?\s*(?:\(([^)]*)\))?\s*(VALUES|SELECT|DEFAULT)\b/i);
+    const idc = im ? ctx.identity(im[1]) : null;
+    if (idc) {
+      if (im[2] !== undefined) {
+        const cols = im[2].split(',').map(x => stripId(x).toLowerCase());
+        if (cols.includes(idc.toLowerCase())) throw TErr(544, `Cannot insert explicit value for identity column in table '${im[1]}' when IDENTITY_INSERT is set to OFF.`);
+      } else if (im[3].toUpperCase() === 'VALUES') {
+        const p = m.indexOf('(', m.search(/\bVALUES\b/i) + 6);
+        let d = 0, e = -1;
+        for (let i = p; p >= 0 && i < m.length; i++) {
+          if (m[i] === '(') d++;
+          else if (m[i] === ')') { d--; if (!d) { e = i; break; } }
+        }
+        if (e > 0 && splitTop(m.slice(p + 1, e)).length === ctx.colCount(im[1])) {
+          throw TErr(8101, `An explicit value for the identity column in table '${im[1]}' can only be specified when a column list is used and IDENTITY_INSERT is ON.`);
+        }
+      }
+    }
+  }
+
+  if (fw === 'UPDATE') {
+    const um = m.match(/^\s*UPDATE\s+(?:\[?dbo\]?\s*\.\s*)?[\["]?(\w+)[\]"]?\s+SET\s+([\s\S]*)$/i);
+    const idc = um ? ctx.identity(um[1]) : null;
+    if (idc) {
+      for (const a of splitTop(um[2].split(/\bWHERE\b/i)[0])) {
+        const lm = a.match(/^\s*[\["]?(\w+)[\]"]?\s*=/);
+        if (lm && lm[1].toLowerCase() === idc.toLowerCase()) throw TErr(8102, `Cannot update identity column '${idc}'.`);
+      }
+    }
+  }
+}
+/*VALIDATE-END*/
+
+function identityCol(d, t) {
+  if (!/^\w+$/.test(t)) return null;
+  try {
+    const r = d.exec("SELECT sql FROM sqlite_master WHERE type='table' AND lower(name)=lower('" + t + "')");
+    if (!r.length || !/AUTOINCREMENT/i.test(String(r[0].values[0][0]))) return null;
+    const pk = columns(d, t).find(c => c.pk);
+    return pk ? pk.name : null;
+  } catch (e) { return null; }
+}
+
+function makeCtx() {
+  const d = db();
+  let objs = null;
+  const getObjs = () => objs || (objs = listObjects(d));
+  return {
+    hasTable: n => getObjs().some(o => o.name.toLowerCase() === n.toLowerCase()),
+    hasColumn: n => getObjs().some(o => columns(d, o.name).some(c => c.name.toLowerCase() === n.toLowerCase())),
+    identity: t => identityCol(d, t),
+    colCount: t => columns(d, t).length
+  };
 }
 
 /* ===================== выполнение ===================== */
@@ -369,6 +529,7 @@ function runStatement(raw) {
     return { msg: 'Commands completed successfully.' };
   }
 
+  validateTsql(s, makeCtx());
   const sql = translate(s);
 
   if (/^(SELECT|WITH)\b/i.test(sql)) {
